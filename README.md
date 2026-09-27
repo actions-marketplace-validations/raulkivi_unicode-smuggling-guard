@@ -48,6 +48,7 @@ Findings appear as error annotations on the pull request diff and as a table in 
 |---|---|---|
 | `paths` | `.` | Files or directories, separated by spaces or newlines. Directories honour `.gitignore`. |
 | `ignore` | | Categories to skip, e.g. `bidi` for right-to-left documentation. |
+| `preset` | | `agent-files` scans only [agent files](#agent-files-and-mcp-tool-descriptions). |
 | `fail-on-findings` | `true` | `false` annotates without failing the step. |
 
 Needs `python3` on the runner. GitHub-hosted runners already have it.
@@ -58,10 +59,12 @@ Needs `python3` on the runner. GitHub-hosted runners already have it.
 # .pre-commit-config.yaml
 repos:
   - repo: https://github.com/raulkivi/unicode-smuggling-guard
-    rev: v1.1.0
+    rev: v1.2.0
     hooks:
       - id: unicode-smuggling-guard
 ```
+
+Use `id: unicode-smuggling-guard-agent-files` to check only agent files.
 
 ### Command line
 
@@ -74,9 +77,44 @@ unicode-smuggling-guard path/to/repo     # short alias: usguard
 |---|---|
 | `--format text\|github` | Compiler-style lines (default) or GitHub workflow annotations. |
 | `--ignore CATEGORY` | Skip a category; repeatable. |
+| `--preset agent-files` | Scan only [agent files](#agent-files-and-mcp-tool-descriptions). |
 | `--summary FILE` | Append a Markdown table, e.g. to `$GITHUB_STEP_SUMMARY`. |
+| `-` (as a path) | Read standard input, e.g. MCP tool descriptions. |
 
-Exit status: `0` clean, `1` hidden characters found, `2` usage error.
+Exit status: `0` clean, `1` hidden characters or control tokens found, `2` usage error.
+
+## Agent files and MCP tool descriptions
+
+AI coding agents load these files as trusted instructions. `--preset agent-files` limits a scan to them:
+
+| Agent or format | Files |
+|---|---|
+| Any (AGENTS.md standard) | `AGENTS.md`, `AGENT.md` |
+| Claude Code | `CLAUDE.md`, `CLAUDE.local.md`, `SKILL.md`, everything under `.claude/` |
+| Cursor | `.cursorrules`, `*.mdc`, everything under `.cursor/` |
+| GitHub Copilot | `copilot-instructions.md`, `*.instructions.md`, `*.prompt.md`, `*.chatmode.md`, `*.agent.md`, `.github/{instructions,prompts,agents,chatmodes}/` |
+| Gemini CLI | `GEMINI.md`, `.gemini/` |
+| Windsurf, Cline, Kiro, Junie, Amazon Q, Roo | `.windsurfrules`, `.clinerules`, `.windsurf/`, `.kiro/`, `.junie/`, `.amazonq/`, `.roo/` |
+| MCP configuration | `mcp.json`, `.mcp.json`, `claude_desktop_config.json` |
+
+Without the preset, all text files are scanned and agent files get one extra check: [chat-template control tokens](#what-it-detects).
+
+```yaml
+# Only agent files, e.g. in a repo whose test fixtures contain bidi text on purpose
+      - uses: raulkivi/unicode-smuggling-guard@v1
+        with:
+          preset: agent-files
+```
+
+An MCP server's tool descriptions reach the model without being shown to the user. Scan what a server actually returns before you install or update it:
+
+```sh
+npx @modelcontextprotocol/inspector --cli node build/index.js --method tools/list \
+  | jq -r '.. | objects | .description // empty' \
+  | unicode-smuggling-guard -
+```
+
+`jq` recursion includes the parameter descriptions in `inputSchema`, where payloads also hide. Standard input counts as agent content, so control tokens are checked too.
 
 ## What it detects
 
@@ -88,6 +126,7 @@ Exit status: `0` clean, `1` hidden characters found, `2` usage error.
 | `zero-width` | U+200B–200D, U+2060, U+FEFF, U+180E | Splits keywords to dodge filters and review; hides watermarks. |
 | `control` | C0/C1 controls except tab, LF, CR, form feed | Terminal escape injection, invisible bytes. |
 | `invisible` | Other format characters (e.g. soft hyphen, invisible operators), Hangul fillers, line/paragraph separators | Blank-rendering characters used to pad or disguise text. |
+| `control-token` | Chat-template tokens: `<\|im_start\|>`, `<\|start_header_id\|>`, `<start_of_turn>`, `[INST]`, `<<SYS>>`, DeepSeek `<｜User｜>`. Agent files and stdin only. | Turn forgery: when a serving stack renders the template without escaping content, the token opens a new system or user turn. Visible, but reviewers do not recognise it. |
 
 ### Legitimate uses it allows
 
@@ -95,6 +134,7 @@ Exit status: `0` clean, `1` hidden characters found, `2` usage error.
 - Zero-width joiners inside emoji sequences and non-Latin words: family emoji, Persian and Indic text.
 - Subdivision flag tag sequences: England, Scotland, Wales.
 - A byte-order mark at the very start of a file.
+- Chat-template tokens outside agent files: code that formats prompts for local models uses them on purpose.
 
 Anything else in these categories is reported. A run of selectors after an emoji is the signature of byte smuggling and is always reported.
 
@@ -110,7 +150,67 @@ Decoded payloads are attacker-controlled. The scanner escapes them for each outp
 
 - Skipped: binary files (any NUL byte), files over 10 MB, symlinks, UTF-16 text.
 - Invalid UTF-8 is read with replacement characters; the valid parts are still scanned.
-- Out of scope: visible homoglyphs (Cyrillic `а` for Latin `a`) and plain-text prompt injection.
+- Escape sequences are not decoded: `\u200b` written as six ASCII characters in JSON or source code is not reported.
+- Out of scope: visible homoglyphs (Cyrillic `а` for Latin `a`) and plain-text prompt injection other than chat-template tokens.
+
+## Compared with agent-skill and MCP scanners
+
+[NVIDIA SkillSpector](https://github.com/nvidia/skillspector), [Cisco skill-scanner](https://github.com/cisco-ai-defense/skill-scanner) and [Snyk agent-scan](https://github.com/snyk/agent-scan) audit what a skill or MCP server does: static rules, YARA signatures, code analysis and optional LLM or cloud judgement. unicode-smuggling-guard does one narrow job: it finds text that a reviewer cannot see or does not recognise.
+
+| | unicode-smuggling-guard | Skill and MCP scanners |
+|---|---|---|
+| Finds | Hidden Unicode with decoded payloads; chat-template tokens | Malicious code, exfiltration, prompt injection, vulnerable dependencies and more |
+| Method | Fixed character rules: same input, same result | Rules plus optional LLM or cloud analysis |
+| Scope | Every text file in the repository, or standard input | Skill packages and MCP servers |
+| Dependencies | None beyond Python | Python packages; API keys or an account for the LLM and cloud engines |
+| Network | Never | Optional in SkillSpector and skill-scanner; Snyk agent-scan sends component data to Snyk's API |
+
+Use unicode-smuggling-guard as the gate on every commit and pull request. Add a skill or MCP scanner when you install third-party skills or servers, or when you want a judgement on plain-language instructions.
+
+## FAQ
+
+### How do I detect hidden Unicode in pull requests?
+
+Add the [GitHub Action](#github-action) to a `pull_request` workflow. Each hidden run appears as an error annotation on the diff line, and the check fails. Make it a required status check to block the merge.
+
+### Doesn't GitHub already warn about hidden characters?
+
+GitHub shows a banner on files with hidden or bidirectional Unicode. The banner blocks nothing, does not say what the characters decode to, and does not cover text outside the repository, such as MCP tool descriptions.
+
+### How do I scan `SKILL.md`, `AGENTS.md` or `CLAUDE.md` for prompt injection?
+
+Run `unicode-smuggling-guard --preset agent-files .` or set `preset: agent-files` in the Action. It reports instructions hidden in invisible characters and forged chat-template turns. Instructions written in plain, visible language need a reviewer or a [skill scanner](#compared-with-agent-skill-and-mcp-scanners).
+
+### How do I check MCP tool descriptions for hidden instructions?
+
+Pipe the server's `tools/list` output into `unicode-smuggling-guard -`; see [Agent files and MCP tool descriptions](#agent-files-and-mcp-tool-descriptions). Check again after each server update: a server can change its descriptions after you approved it.
+
+### What is ASCII smuggling?
+
+Each character in the Unicode Tags block (U+E0000–E007F) mirrors one ASCII character but renders as nothing. A sentence written in tags stays invisible in editors, diffs and chat windows, while LLM tokenizers still read it. The scanner reports the run and decodes it back to ASCII.
+
+### How do I block Trojan Source (CVE-2021-42574) attacks?
+
+The `bidi` category reports the directional overrides and isolates that make code display differently from how it compiles. It is on by default. Repositories with right-to-left documentation can scan code and docs in separate steps and pass `ignore: bidi` for the docs.
+
+### Will it flag emoji, Persian or Hindi text?
+
+No. Emoji variation selectors, emoji ZWJ sequences, ZWNJ/ZWJ in non-Latin scripts, subdivision flags and a leading BOM are [allowed](#legitimate-uses-it-allows).
+
+### Does it send my code anywhere?
+
+No. It reads files locally, has no runtime dependencies and makes no network calls.
+
+## Versioning
+
+Versions follow [Semantic Versioning](https://semver.org/). The `v1` tag tracks the latest 1.x release. Within `v1`:
+
+- Action inputs, CLI options, pre-commit hook ids and exit codes (`0`, `1`, `2`) stay backward compatible.
+- Text output keeps the `path:line:column: category:` prefix, and `--format github` keeps emitting `::error` annotations.
+- Releases may detect more: new characters, categories or agent-file paths. A repository that scanned clean can fail after an update. To choose when that happens, pin a release (`@v1.2.0`) or a commit SHA, and let Dependabot propose updates.
+
+Breaking changes go to `v2`, with migration notes in the [changelog](CHANGELOG.md).
+After `v2.0.0`, `v1` gets security fixes for 6 months from a `release/v1` branch.
 
 ## Design
 
@@ -119,18 +219,23 @@ classDiagram
     direction LR
     class cli { main(argv) int }
     class files { iter_files(paths) read_text(path) }
+    class agent_files { is_agent_file(path) bool }
     class scanner { scan(text) List~Finding~ }
+    class tokens { scan_control_tokens(text) List~Finding~ }
     class categories { classify(ch) Category }
     class decode { decode(category, codepoints) str }
     class report { format_text() format_github() summary_markdown() }
     cli --> files
+    cli --> agent_files
     cli --> scanner
+    cli --> tokens
     cli --> report
     scanner --> categories
+    tokens --> scanner
     report --> decode
 ```
 
-`categories` knows which code points are hidden. `scanner` groups them into runs and applies the legitimate-use rules. `decode` recovers smuggled text. `report` owns every output format and its escaping.
+`categories` knows which code points are hidden. `scanner` groups them into runs and applies the legitimate-use rules. `tokens` finds chat-template control tokens. `agent_files` decides which paths agents load as instructions. `decode` recovers smuggled text. `report` owns every output format and its escaping.
 
 ## Development
 
